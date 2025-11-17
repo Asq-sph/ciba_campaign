@@ -1,0 +1,335 @@
+--base code is version 5g
+--remove ga3 CTE ga3_st_articlepv_web
+--remove ga3 CTE eshop3_articlessessions_conversions
+--in CTE ga4_cas_raw, replaced COALESCE(NULLIF(TRIM(CAST(cue_articleid as varchar)),''),NULLIF(TRIM(CAST(article_id AS varchar)),'') ) with NULLIF(TRIM(CAST(article_id AS varchar)),'') AS ga_article_id, 
+--in CTE ga4_st_articlepv_web 
+   --remove following from where conditions. why? these conditions limit to only articles and other page types (landing page, live blogs, etc will not show up)
+    --content_category IN ('premium','free')
+    --(NULLIF(TRIM(cue_articleid),'') IS NOT NULL OR NULLIF(TRIM(article_id),'') IS NOT NULL)
+    --STRPOS(LOWER(article_keyword),'branded content')
+   -- add 
+    --article_page_url,
+    -- (CASE 
+    --WHEN (content_type = 'live blog') THEN 'live blog'
+    --WHEN article_id is not null THEN 'article'
+    --WHEN (article_id IS NULL AND lower(chapter1) ='digital-graphics') THEN 'interactive'
+    --WHEN (url like '%/multimedia/graphics%') THEN 'multimedia'
+    --WHEN (url like '%/tags/%') THEN 'keyword_index_pages'
+    --ELSE 'landing pages and others' 
+    --END ) as "page_type",
+    
+-- in CTE ga_article_stats_pv_wall, ga_article_stats_pv_wall_conv, final select statement
+    --add a.article_page_url, a.page_referrer, a.page_type,
+    
+
+WITH
+------------------------------------------------------------------
+-- Stage1: create reference CTE tables containing article metadata
+------------------------------------------------------------------
+drupal AS (
+--gets key fields from drupal
+SELECT
+    'drupal' AS cms_source,
+    NULLIF(TRIM(article_cue_id),'') AS cms_article_cue_id,
+    NULLIF(TRIM(CAST(article_id AS VARCHAR)),'') AS cms_article_drupal_id,
+    NULLIF(CONCAT(
+        COALESCE(TRIM(CAST(article_id AS VARCHAR)), ''),' ',
+        COALESCE(TRIM(article_cue_id), '')
+    ),'_') AS cms_article_merge_id,
+    article_content_access AS cms_article_content_access,
+    DATE(article_created_date) AS cms_article_created_date,
+    article_path_url AS cms_article_path_url,
+    article_title AS cms_article_display_headline,
+    article_keywords AS cms_article_keywords,
+    print_copyright AS cms_print_copyright,
+    chapter1 AS cms_chapter1,
+    chapter2 AS cms_chapter2
+FROM silver_drupal_st.st_article_details
+WHERE STRPOS(article_path_url,'/newsletter/') = 0
+-- can't use the following for DRUPAL as it filters out larger number drupal_id duplicates.
+-- LOWER(article_post_status) = 'published'
+AND STRPOS(LOWER(COALESCE(article_keywords, '')), 'branded content') = 0
+AND DATE(article_created_date) < DATE'2023-01-01'
+),
+caas AS (
+--gets key fields from caas
+SELECT
+    'caas' AS cms_source,
+    NULLIF(TRIM(article_id),'') AS cms_article_cue_id,
+    NULLIF(TRIM(CAST(drupal_article_id AS VARCHAR)),'') AS cms_article_drupal_id,
+    NULLIF(CONCAT(
+        COALESCE(TRIM(CAST(drupal_article_id AS VARCHAR)), ''),' ',
+        COALESCE(TRIM(article_id), '')
+    ),'_') AS cms_article_merge_id,
+    article_content_access AS cms_article_content_access,
+    DATE(article_updated_timestamp_sgt) AS cms_article_created_date,
+    REPLACE(article_path_url, 'straitstimes.com.sg', 'straitstimes.com') AS cms_article_path_url,
+    article_title AS cms_article_display_headline,
+    article_tags AS cms_article_keywords,
+    print_copyright AS cms_print_copyright,
+    chapter1 AS cms_chapter1,
+    chapter2 AS cms_chapter2
+FROM silver_caas.article_details
+WHERE publication = 'straitstimes'
+AND lower(caas_article_avail) ='published'
+AND DATE(article_updated_timestamp_sgt) >= DATE'2023-01-01'
+), 
+--left joins caas and drupal to the universe table and gets the most accurate fields using coalease
+cms_st_articles_details AS (
+SELECT * FROM drupal
+UNION
+SELECT * FROM caas
+),
+------------------------------------------------------------
+-- Stage2: create fact CTE tables containing article metrics
+------------------------------------------------------------
+-- To get pv for each article id
+-- Web only. Excludes epaper
+ga4_st_articlepv_web AS (
+SELECT
+event_date,
+article_page_url,
+-- To provide articleID for JOINs latter, ga_article_id first then ga_article_cue_id if former is NULL.
+-- NULLified if articleID is just a space, to avoid code JOINing on the latter.
+    (CASE 
+    WHEN (content_type = 'live blog') THEN 'live blog'
+    WHEN article_id is not null THEN 'article'
+    WHEN (article_id IS NULL AND lower(chapter1) ='digital-graphics') THEN 'interactive'
+    WHEN (url like '%/multimedia/graphics%') THEN 'multimedia'
+    WHEN (url like '%/tags/%') THEN 'keyword_index_pages'
+    ELSE 'landing pages and others' 
+    END ) as "page_type",
+NULLIF(TRIM(article_id),'') AS ga_article_id, 
+LOWER(cd_version) AS ga_cd_version,
+SUM(page_view_valid) AS ga_pv,
+COUNT(DISTINCT user_pseudo_id) AS ga_users
+FROM silver_ga.ga4
+WHERE event_date >= DATE'2025-10-01'
+AND publication = 'st'
+--AND content_category IN ('premium','free')
+AND is_epaper = false
+--AND (NULLIF(TRIM(cue_articleid),'') IS NOT NULL OR NULLIF(TRIM(article_id),'') IS NOT NULL)
+AND platform = 'web'
+--AND STRPOS(LOWER(article_keyword),'branded content') = 0
+--AND url like 'https://www.straitstimes.com/site-smart-parenting%' -- testing
+--AND page_title = 'Nuôi dạy con thông minh ST' -- testing
+GROUP BY 1,2,3,4,5
+),
+ga_st_articlepv_web_union AS (
+SELECT * FROM ga4_st_articlepv_web
+),
+--------------------------------------------
+-- Stage3: create CAS metrics per article_id
+--------------------------------------------
+ga4_cas_raw AS (
+SELECT 
+    event_date, 
+    event_category, 
+    LOWER(event_action) AS event_action, 
+    CASE WHEN host_name = 'www.straitstimes.com' THEN 'st'
+    WHEN host_name = 'www.businesstimes.com.sg' THEN 'bt'
+    WHEN host_name = 'www.beritaharian.sg' THEN 'bh'
+    WHEN host_name = 'www.zaobao.com.sg' THEN 'zbsg'
+    WHEN host_name = 'www.tamilmurasu.com.sg' THEN 'tm' END AS hostname,
+    --COALESCE(NULLIF(TRIM(CAST(cue_articleid as varchar)),''),NULLIF(TRIM(CAST(article_id AS varchar)),'') ) ga_article_id,
+    NULLIF(TRIM(CAST(article_id AS varchar)),'') AS ga_article_id, 
+    content_category, 
+    page_title
+FROM "silver_ga"."ga4_cas"
+WHERE 
+host_name = 'www.straitstimes.com'
+AND event_date >= DATE'2025-10-01'
+AND event_name = 'custom_web_event'
+),
+ga_cas_agg AS (
+SELECT 
+    event_date,
+    ga_article_id,
+    SUM(CASE WHEN event_category = 'CAS-exit_intervention' AND event_action='impression' then 1 ELSE 0 END) cas_ei_impression_events,
+    SUM(CASE WHEN event_category = 'CAS-exit_intervention' AND event_action like '%click%subscribe%' THEN 1 ELSE 0 END) cas_ei_click_subscribe_events,
+    SUM(CASE WHEN event_category = 'CAS-pay_wall' AND event_action ='impression' then 1 ELSE 0 END) cas_paywall_impression_events,
+    SUM(CASE WHEN event_category = 'CAS-pay_wall' AND REGEXP_LIKE(event_action, 'click-image_banner|click.*subscribe|click.*unlock|click.*claim_offer|click.*claim_promotion|click.*continue_reading|click.*langgani.*sekarang|click-立即订阅|click-立即訂閱|click-继续阅读|click-订阅阅读|click-立刻订阅') THEN 1 ELSE 0 END) cas_paywall_click_subscribe_events, --click.*unlock added in 5e, click.*claim_offer|click.*claim_promotion added in 5g
+    SUM(CASE WHEN event_category = 'CAS-free' AND event_action ='impression' then 1 ELSE 0 END) cas_freewall_impression_events,
+    SUM(CASE WHEN event_category = 'CAS-free' AND REGEXP_LIKE(event_action, 'click-image_banner|click.*subscribe|click.*unlock|click.*claim_offer|click.*claim_promotion|click.*continue_reading|click.*langgani.*sekarang|click-立即订阅|click-立即訂閱|click-继续阅读|click-订阅阅读|click-立刻订阅') THEN 1 ELSE 0 END) cas_freewall_click_subscribe_events, --click.*unlock added in 5e, click.*claim_offer|click.*claim_promotion added in 5g
+    SUM(CASE WHEN event_category = 'CAS-exit_intervention' AND REGEXP_LIKE(event_action, 'click.*') AND event_action not like '%click%subscribe%' THEN 1 ELSE 0 END) cas_ei_click_others_events, --added in 5e, click.*claim_offer|click.*claim_promotion added in 5g
+    SUM(CASE WHEN event_category = 'CAS-pay_wall' AND REGEXP_LIKE(event_action, 'click.*') AND NOT REGEXP_LIKE(event_action, 'click-image_banner|click.*subscribe|click.*unlock|click.*claim_offer|click.*claim_promotion|click.*continue_reading|click.*langgani.*sekarang|click-立即订阅|click-立即訂閱|click-继续阅读|click-订阅阅读|click-立刻订阅') THEN 1 ELSE 0 END) cas_paywall_click_other_events, --added in 5e, click.*claim_offer|click.*claim_promotion added in 5g
+    SUM(CASE WHEN event_category = 'CAS-free' AND REGEXP_LIKE(event_action, 'click.*') AND NOT REGEXP_LIKE(event_action, 'click-image_banner|click.*subscribe|click.*unlock|click.*claim_offer|click.*claim_promotion|click.*continue_reading|click.*langgani.*sekarang|click-立即订阅|click-立即訂閱|click-继续阅读|click-订阅阅读|click-立刻订阅') THEN 1 ELSE 0 END) cas_freewall_click_other_events --added in 5e, click.*claim_offer|click.*claim_promotion added in 5g
+FROM ga4_cas_raw 
+GROUP BY 1,2
+),
+ga_cas AS (
+select 
+    event_date,
+    ga_article_id,
+    cas_ei_impression_events,
+    cas_ei_click_subscribe_events, 
+    cas_paywall_impression_events, 
+    cas_paywall_click_subscribe_events,
+    cas_freewall_impression_events, 
+    cas_freewall_click_subscribe_events,
+    cas_ei_click_others_events, --added in 5e
+    cas_paywall_click_other_events,  --added in 5e
+    cas_freewall_click_other_events --added in 5e
+FROM ga_cas_agg
+),
+--------------------------------
+-- Stage4: create Eshop data CTE
+--------------------------------
+eshop_exclude_emails AS (
+SELECT
+LOWER(visitor_id) AS visitor_id
+FROM silver_mysph.mysph_user_profiles
+WHERE (STRPOS(email,'sph.com.sg') > 0 OR STRPOS(email,'@mailinator') > 0 OR STRPOS(email,'@inboxkitten.com') > 0)
+),
+-- To retrieve correct session's traffic attribution, since mid session UTM values do change
+-- Will be along the lines of "as long as article bought traffic to eshop" angle
+-- Using GA4 session level last non-direct attribution
+eshop4_articlesessions AS (
+SELECT
+ROW_NUMBER() OVER (PARTITION BY ga_session_key ORDER BY event_timestamp ASC) AS rn,
+event_date,
+ga_session_key,
+TRIM(session_term) AS session_term -- remove whitespace
+FROM
+silver_ga.ga4_eshop
+WHERE event_date >= DATE'2025-10-01'
+AND host_name = 'subscribe.sph.com.sg'
+AND REGEXP_LIKE(session_term, '^[0-9]{6,7}$')
+AND STRPOS(cd_referral_url, 'straitstimes.com') > 0
+),
+-- To retrieve sessions with conversions
+eshop4_convertsessions AS (
+SELECT
+DISTINCT 
+event_date,
+ga_session_key,
+COALESCE(transaction_id, order_id) AS transaction_id
+FROM silver_ga.ga4_eshop
+WHERE event_date >= DATE'2025-10-01'
+AND host_name = 'subscribe.sph.com.sg'
+AND event_name = 'purchase'
+AND STRPOS(LOWER(eshop_product_family), 'st') > 0
+AND NOT EXISTS (SELECT 1 FROM eshop_exclude_emails WHERE eshop_exclude_emails.visitor_id = LOWER(TRIM(mysph_hash)))
+),
+-- To filter down to the earliest row with external traffic attribution, and with conversion columns available
+-- Step needed since majority of conversion sessions have their traffic attribution overwritten by Cybersource
+eshop4_articlessessions_conversions AS (
+SELECT
+a.event_date,
+a.ga_session_key,
+a.session_term,
+b.transaction_id
+FROM eshop4_articlesessions a LEFT JOIN eshop4_convertsessions b on a.ga_session_key = b.ga_session_key
+WHERE rn = 1
+),
+-- To union both eshop GA3 and GA4 data
+eshop_articleconversions_union AS (
+SELECT * FROM eshop4_articlessessions_conversions
+),
+-- To calculate combined conversions per article_id across GA3 and GA4 (eshop_session_term)
+eshop_articleconversions AS (
+SELECT
+event_date,
+session_term AS eshop_session_term,
+COUNT(DISTINCT ga_session_key) AS eshop_sessions_breaches,
+COUNT(ga_session_key) AS eshop_breaches,
+COUNT(DISTINCT transaction_id) AS eshop_conversions
+FROM eshop_articleconversions_union
+GROUP BY 1,2
+),
+---------------------------------------
+-- Stage5: Join ST GA web to CAS GA web
+---------------------------------------
+-- To create fact GA table first, JOINing GA pageview and conversion stats on daily basis first
+-- Then have cms_st_articles_details CTE LEFT JOIN with right side GA table
+ga_article_stats_pv_wall AS (
+SELECT
+a.article_page_url,
+a.page_type,
+a.ga_article_id,
+a.event_date,
+a.ga_cd_version,
+a.ga_pv,
+a.ga_users,
+COALESCE(b.cas_ei_impression_events, b1.cas_ei_impression_events) AS cas_ei_impression_events,
+COALESCE(b.cas_ei_click_subscribe_events, b1.cas_ei_click_subscribe_events) AS cas_ei_click_subscribe_events,
+COALESCE(b.cas_paywall_impression_events, b1.cas_paywall_impression_events) AS cas_paywall_impression_events,
+COALESCE(b.cas_paywall_click_subscribe_events, b1.cas_paywall_click_subscribe_events) AS cas_paywall_click_subscribe_events,
+COALESCE(b.cas_freewall_impression_events, b1.cas_freewall_impression_events) AS cas_freewall_impression_events,
+COALESCE(b.cas_freewall_click_subscribe_events, b1.cas_freewall_click_subscribe_events) AS cas_freewall_click_subscribe_events
+FROM ga_st_articlepv_web_union a
+LEFT JOIN ga_cas b 
+    ON a.event_date = b.event_date AND a.ga_article_id = b.ga_article_id AND a.ga_cd_version IS DISTINCT FROM 'st2'
+LEFT JOIN ga_cas b1
+    ON b.ga_article_id IS NULL AND a.event_date = b1.event_date AND a.ga_article_id = b1.ga_article_id AND a.ga_cd_version = 'st2'
+),
+---------------------------------------------
+-- Stage6: join Eshop GA web to previous JOIN
+---------------------------------------------
+-- On this LEFT JOIN, have the age of article calculated via event_date MINUS article_created_date
+-- JOIN between ga_st_articlepv_web_union and eshop_articleconversions has unknown variable of whether drupal-id or cue-id is passed to eshop as session_term, but assume eshop_session_term is filled with whatever was provided under ga_article_id by CAS
+-- See evidence https://docs.google.com/spreadsheets/d/1pK_5iOgpUvrOj6oPjzUt1qtHh2U7HdISc4kOIMenksU/edit?gid=215411408#gid=215411408&range=AS4
+-- See evidence https://docs.google.com/spreadsheets/d/1pK_5iOgpUvrOj6oPjzUt1qtHh2U7HdISc4kOIMenksU/edit?gid=215411408#gid=215411408&range=O260
+-- See evidence https://docs.google.com/spreadsheets/d/1pK_5iOgpUvrOj6oPjzUt1qtHh2U7HdISc4kOIMenksU/edit?gid=215411408#gid=215411408&range=AN471
+-- ga_cd_version is needed to ensure correct LEFT JOIN with cms_st_articles_details
+ga_article_stats_pv_wall_conv AS (
+SELECT
+a.article_page_url,
+a.page_type,
+a.ga_article_id,
+a.event_date,
+a.ga_cd_version,
+a.ga_pv,
+a.ga_users,
+a.cas_ei_impression_events,
+a.cas_ei_click_subscribe_events,
+a.cas_paywall_impression_events,
+a.cas_paywall_click_subscribe_events,
+a.cas_freewall_impression_events,
+a.cas_freewall_click_subscribe_events,
+COALESCE(b.eshop_sessions_breaches,0) + COALESCE(b1.eshop_sessions_breaches,0) AS eshop_arrivals,
+COALESCE(b.eshop_breaches,0) + COALESCE(b1.eshop_breaches,0) AS eshop_arrivals_events,
+COALESCE(b.eshop_conversions,0) + COALESCE(b1.eshop_conversions,0) AS eshop_conversions
+FROM ga_article_stats_pv_wall a
+LEFT JOIN eshop_articleconversions b
+    ON a.event_date = b.event_date AND a.ga_article_id = b.eshop_session_term AND a.ga_cd_version IS DISTINCT FROM 'st2'
+LEFT JOIN eshop_articleconversions b1
+    ON b.eshop_session_term IS NULL AND a.event_date = b1.event_date AND a.ga_article_id = b1.eshop_session_term AND a.ga_cd_version = 'st2'
+)
+-----------------------------------------------------------------------------------
+-- Stage7: join GA table with Drupal / CUE dataset details and aggregate by GA date
+-----------------------------------------------------------------------------------
+-- multiple LEFT JOINs needed to ensure successful match with Drupal / CUE dataset
+-- due to possibility that either ga_article_id or ga_article_cue_id is missing
+-- COALESCEing and ga_article_id and ga_article_cue_id will introduce risk of unsuccessful LEFT JOIN at this stage
+SELECT
+a.event_date AS ga_event_date,
+a.article_page_url,
+a.page_type,
+COALESCE(b.cms_article_merge_id, b1.cms_article_merge_id) AS cms_article_merge_id,
+COALESCE(b.cms_article_created_date, b1.cms_article_created_date) AS cms_article_created_date,
+COALESCE(b.cms_article_display_headline, b1.cms_article_display_headline) AS cms_article_display_headline,
+COALESCE(b.cms_print_copyright, b1.cms_print_copyright) AS cms_print_copyright,
+COALESCE(b.cms_article_content_access, b1.cms_article_content_access) AS cms_article_content_access,
+COALESCE(b.cms_article_keywords, b1.cms_article_keywords) AS cms_article_keywords,
+COALESCE(b.cms_chapter1, b1.cms_chapter1) AS cms_chapter1,
+COALESCE(b.cms_chapter2, b1.cms_chapter2) AS cms_chapter2,
+COALESCE(b.cms_article_path_url, b1.cms_article_path_url) AS cms_article_path_url,
+DATE_DIFF('day', COALESCE(b.cms_article_created_date, b1.cms_article_created_date), a.event_date) AS article_age_days,
+SUM(a.ga_pv) AS ga_pv,
+SUM(a.ga_users) AS ga_users,
+SUM(a.cas_ei_impression_events) AS cas_ei_impression_events,
+SUM(a.cas_ei_click_subscribe_events) AS cas_ei_click_subscribe_events,
+SUM(a.cas_paywall_impression_events) AS cas_paywall_impression_events,
+SUM(a.cas_paywall_click_subscribe_events) AS cas_paywall_click_subscribe_events,
+SUM(a.cas_freewall_impression_events) AS cas_freewall_impression_events,
+SUM(a.cas_freewall_click_subscribe_events) AS cas_freewall_click_subscribe_events,
+SUM(a.eshop_arrivals) AS eshop_arrivals,
+SUM(a.eshop_arrivals_events) AS eshop_arrivals_events,
+SUM(a.eshop_conversions) AS eshop_conversions
+FROM ga_article_stats_pv_wall_conv a
+LEFT JOIN cms_st_articles_details b
+ON a.ga_article_id = b.cms_article_cue_id AND a.ga_cd_version = 'st2' AND a.event_date >= b.cms_article_created_date
+LEFT JOIN cms_st_articles_details b1
+ON a.ga_article_id = b1.cms_article_drupal_id AND b.cms_article_cue_id IS NULL AND a.ga_cd_version IS DISTINCT FROM 'st2' AND a.event_date >= b1.cms_article_created_date
+GROUP BY 1,2,3,4,5,6,7,8,9,10,11,12
