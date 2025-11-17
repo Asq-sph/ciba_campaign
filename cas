@@ -1,0 +1,20 @@
+SELECT 
+    event_date, 
+    article_page_url,
+    article_keyword,
+    NULLIF(TRIM(CAST(article_id AS varchar)),'') AS ga_article_id, 
+    CASE WHEN host_name = 'www.straitstimes.com' THEN 'st'
+    WHEN host_name = 'www.businesstimes.com.sg' THEN 'bt'
+    WHEN host_name = 'www.beritaharian.sg' THEN 'bh'
+    WHEN host_name = 'www.zaobao.com.sg' THEN 'zbsg'
+    WHEN host_name = 'www.tamilmurasu.com.sg' THEN 'tm' END AS hostname,
+    LOWER(event_category) AS event_category, 
+    LOWER(event_action) AS event_action, 
+    LOWER(event_label) AS event_label,
+    count(*) as event_counts
+FROM "silver_ga"."ga4_cas"
+WHERE 
+host_name = 'www.straitstimes.com'
+AND event_date >= DATE'2025-10-01'
+AND event_name = 'custom_web_event'
+group by 1,2,3,4,5,6,7,8
