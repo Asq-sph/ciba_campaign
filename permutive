@@ -1,0 +1,36 @@
+--note: 14 Nov. Permutive segemnt is using a lookup sheet from Mana, but checking in with her if the permutive_segments are still valid for use.
+
+with 
+ga4_web AS (
+SELECT
+    event_date,
+    article_page_url,
+    article_keyword,
+    page_view_valid,
+    user_pseudo_id,
+    permutive_segment,
+    CASE WHEN permutive_segment like ('%94992%') THEN 1 ELSE 0 END AS "is_parents",
+    CASE WHEN permutive_segment like ('%106104%') THEN 1 ELSE 0 END AS "is_engaged_education",
+    CASE WHEN permutive_segment like ('%103742%') THEN 1 ELSE 0 END AS "is_intenders_education",
+    CASE WHEN permutive_segment like ('%92804%') THEN 1 ELSE 0 END AS "is_interest_education",
+    CASE WHEN permutive_segment like ('%109221%') THEN 1 ELSE 0 END AS "is_interest_Parenting Children below 12"
+FROM silver_ga.ga4
+WHERE event_date >= DATE'2025-10-01'
+AND publication = 'st'
+AND is_epaper = false
+AND platform = 'web'
+)
+
+select     
+    event_date,
+    article_page_url,
+    article_keyword,
+    is_parents, 
+    is_engaged_education,
+    is_intenders_education,
+    is_interest_education,
+    "is_interest_Parenting Children below 12",
+    SUM(page_view_valid) as ga_pv
+    --, COUNT(distinct user_pseudo_id) as users
+FROM ga4_web
+GROUP BY 1,2,3,4,5,6,7,8
