@@ -1,0 +1,133 @@
+--base code is same as what we used in BSC Audience decks
+--add article_page_url,article_keyword fields for grouping of campaign in Tableau
+
+with
+ga4 AS (
+SELECT 
+    event_date,
+    platform,
+    publication,
+    article_page_url,
+    article_keyword,
+    CASE
+    WHEN LOWER(session_source) IS NULL AND LOWER(session_medium) IS NULL THEN 'direct'
+    WHEN LOWER(session_source) = '(not set)' AND LOWER(session_medium) = '(not set)' THEN 'direct'
+    WHEN LOWER(session_source) = 'fb' AND LOWER(session_medium) = 'paid' THEN 'facebook'
+    WHEN LOWER(session_source) = 'social-paid' AND LOWER(session_medium) = 'facebook' THEN 'facebook'
+    WHEN LOWER(session_source) LIKE '%telegram%' THEN 'telegram'
+    WHEN LOWER(session_source) IS NULL THEN 'null'
+    ELSE REPLACE(REPLACE(REPLACE(REPLACE(LOWER(session_source), '.com', ''), 'l.', ''),'m.', ''),'lm.', '')
+    END AS session_source_cleaned,
+    
+    CASE
+    WHEN LOWER(session_source) IS NULL AND LOWER(session_medium) IS NULL THEN 'none'
+    WHEN LOWER(session_source) = '(not set)' AND LOWER(session_medium) = '(not set)' THEN 'none'
+    WHEN LOWER(session_medium) = 'emai' THEN 'email'
+    WHEN LOWER(session_source) = 'fb' AND LOWER(session_medium) = 'paid' THEN 'social-paid'
+    WHEN LOWER(session_source) = 'social-paid' AND LOWER(session_medium) = 'facebook' THEN 'social-paid'
+    WHEN LOWER(session_source) = 'telegram' AND LOWER(session_medium) LIKE '%social-organic%' THEN 'social-organic'
+    WHEN LOWER(session_medium) IS NULL THEN 'null'
+    ELSE LOWER(session_medium)
+    END AS session_medium_cleaned,
+    page_view_valid,
+    user_pseudo_id,
+    ga_session_key
+FROM silver_ga.ga4
+WHERE event_date >= DATE'2025-10-01'
+AND publication = 'st'
+AND is_epaper = false
+AND platform = 'web'
+),
+
+ga4_cleaned AS (
+SELECT   
+    event_date,
+    platform,
+    publication,
+    article_page_url,
+    article_keyword,
+    session_source_cleaned,
+    session_medium_cleaned,
+    CONCAT(session_source_cleaned, '/', session_medium_cleaned) as session_source_medium_cleaned,
+    CASE
+    WHEN session_source_cleaned = 'direct' AND session_medium_cleaned = 'none' THEN 'Direct'
+    
+    WHEN session_source_cleaned like '%chatgpt%' then 'AI Chatbot'
+    WHEN session_source_cleaned like '%perplexity%' then 'AI Chatbot'
+    WHEN session_source_cleaned like '%deepseek%' then 'AI Chatbot'
+    
+    WHEN session_source_cleaned IN ('telegram', 'whatsapp') THEN 'Messaging'
+    
+    WHEN session_source_cleaned IN ('outbrain', 'taboola') AND session_medium_cleaned IN ('cpc') THEN 'Native Paid CD'
+    WHEN (session_source_cleaned IN ('outbrain') AND session_medium_cleaned IN ('dc-outbrain-sponsored')) THEN 'Native Paid MMS'
+    WHEN (session_source_cleaned IN ('taboola') AND session_medium_cleaned IN ('dc-taboola-sponsored')) THEN 'Native Paid MMS'
+    WHEN (session_source_cleaned LIKE ('%taboola%') AND session_medium_cleaned IN ('referral')) THEN 'Native Organic'
+    WHEN (session_source_cleaned LIKE ('%outbrain%') AND session_medium_cleaned IN ('referral')) THEN 'Native Organic'
+    
+    WHEN session_medium_cleaned like '%dc%' AND (session_medium_cleaned not like '%dc%sponsored%') then 'MMS'
+    
+    WHEN session_source_cleaned = 'emarsys' AND session_medium_cleaned = 'email' THEN 'Newsletters'
+    
+    
+    WHEN session_source_cleaned = 'google-play' AND session_medium_cleaned = 'organic' THEN 'Organic App Store'
+    
+    WHEN (session_source_cleaned = 'print') THEN 'Print'
+    WHEN (session_source_cleaned = 'sph' AND session_medium_cleaned = 'print') THEN 'Print'
+    
+    WHEN session_source_cleaned = 'editorialteam' AND session_medium_cleaned = 'notification' THEN 'Push Notification'
+    
+    WHEN session_source_cleaned like '%forum%' then 'Forum'
+    WHEN session_source_cleaned like '%reddit%' then 'Forum'
+    WHEN  session_source_cleaned like '%sgtalk.net%' then 'Forum'
+    
+    
+    -- Referral
+    WHEN session_source_cleaned in ('google', 'bing', 'baidu', 'duckduckgo', 'yahoo', 'naver', 'sogou', 'sg.search.yahoo') AND session_medium_cleaned = 'referral'  then 'Search Referral'
+    WHEN session_source_cleaned in ('facebook','lfacebook','twitter','t.co','x','linkedin','instagram','youtube','ig-story','tiktok','fb','ig','threads', 'threads.net') AND (session_medium_cleaned = 'referral')  then 'Social Referral'
+    
+    WHEN session_source_cleaned in ('news.google') AND session_medium_cleaned = 'referral'  then 'Discovery'
+    WHEN session_source_cleaned in ('google', 'bing', 'baidu', 'duckduckgo', 'yahoo', 'naver', 'sogou') AND session_medium_cleaned = 'organic'  then 'Search Organic'
+    WHEN session_source_cleaned in ('facebook','lfacebook','twitter','t.co','x','linkedin','instagram','youtube','ig-story','tiktok','fb','ig','threads','threads.net') AND session_medium_cleaned like '%paid%' then 'Social Paid CD'
+    WHEN (session_source_cleaned IN ('facebook','lfacebook','twitter','t.co','x','linkedin','instagram','youtube','ig-story','tiktok','fb','ig','threads','threads.net') AND session_medium_cleaned LIKE '%social%') THEN 'Social Organic'
+    WHEN session_source_cleaned = 'google' AND session_medium_cleaned = 'cpc' THEN 'Search Paid CD'
+    
+    
+    WHEN platform = 'web' AND session_source_cleaned in ('facebook','lfacebook','twitter','t.co','x','linkedin','instagram','youtube','ig-story','tiktok','fb','ig','threads') AND session_medium_cleaned like '%sponsored%' then 'Social Paid MMS'
+    
+    WHEN platform = 'web' AND publication='st' AND session_source_cleaned like '%straitstimes%' AND session_medium_cleaned = 'referral' then 'Internal Traffic'
+    WHEN platform = 'web' AND publication='zbsg' AND session_source_cleaned like '%zaobao.com.sg%' AND session_medium_cleaned = 'referral' then 'Internal Traffic'
+    WHEN platform = 'web' AND publication='bt' AND session_source_cleaned like '%businesstimes%' AND session_medium_cleaned = 'referral' then 'Internal Traffic'
+    
+    
+    WHEN session_source_cleaned = 'cue.cue-prd.sph.sg/referral' AND session_medium_cleaned = 'referral' THEN 'Others'
+    WHEN session_source_cleaned = 'dementiasg-newsletter' AND session_medium_cleaned = 'email' THEN 'Referral'
+    WHEN session_medium_cleaned = 'referral' THEN 'Referral'
+    
+    -- WRONG
+    WHEN (session_source_cleaned = 'cas-st' AND session_medium_cleaned = 'sph-publication')
+    OR (session_source_cleaned = 'bt-app' AND session_medium_cleaned = 'in-app-msg')
+    OR (session_source_cleaned = 'app' OR session_source_cleaned = 'appmessage' OR session_source_cleaned = 'sgapp' OR session_source_cleaned LIKE 'specialpage%')
+    OR (session_source_cleaned = 'newsletter-subnregs' AND session_medium_cleaned = 'banner')
+    OR (session_source_cleaned = 'stories' AND session_medium_cleaned = 'social')
+    THEN 'Incorrect Internal Tagging'
+    
+    ELSE 'Others'
+    END AS channel,
+    page_view_valid,
+    user_pseudo_id,
+    ga_session_key
+FROM ga4
+)
+
+SELECT 
+    event_date,
+    article_page_url,
+    article_keyword, 
+    channel, 
+    session_source_cleaned,
+    session_medium_cleaned, 
+    SUM(page_view_valid) as ga_pv,
+    COUNT(distinct user_pseudo_id) as ga_users,
+    COUNT(distinct ga_session_key) as ga_sessions
+FROM ga4_cleaned
+GROUP BY 1,2,3,4,5,6
